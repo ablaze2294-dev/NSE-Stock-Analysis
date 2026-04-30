@@ -1,0 +1,381 @@
+"""
+NSE Stock Data Fetcher & Emailer
+=================================
+Fetches comprehensive yfinance data for all NSE-listed stocks,
+saves to a multi-sheet Excel file, and emails it via Gmail.
+
+SETUP:
+1. pip install yfinance openpyxl pandas requests
+2. Fill in CONFIG section below
+3. For Gmail App Password: https://myaccount.google.com/apppasswords
+"""
+
+import yfinance as yf
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
+import os
+import time
+import datetime
+import requests
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+#  CONFIG — Fill these in before running
+# ─────────────────────────────────────────────
+CONFIG = {
+    "sender_email":    "your_gmail@gmail.com",       # Gmail address used to send
+    "sender_password": "xxxx xxxx xxxx xxxx",        # Gmail App Password (16 chars)
+    "recipient_email": "recipient@example.com",      # Where to send the report
+    "output_file":     "NSE_Stock_Report.xlsx",
+    "batch_size":      50,    # stocks fetched per batch (reduce if rate-limited)
+    "delay_between_batches": 2,  # seconds between batches
+    "max_stocks":      None,  # set to e.g. 100 for a quick test; None = all stocks
+}
+# ─────────────────────────────────────────────
+
+HEADER_FILL   = PatternFill("solid", start_color="1F4E79")
+HEADER_FONT   = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+ALT_ROW_FILL  = PatternFill("solid", start_color="DCE6F1")
+NORMAL_FONT   = Font(name="Arial", size=9)
+TITLE_FONT    = Font(bold=True, name="Arial", size=11, color="1F4E79")
+THIN_BORDER   = Border(
+    left=Side(style="thin", color="BFBFBF"),
+    right=Side(style="thin", color="BFBFBF"),
+    top=Side(style="thin", color="BFBFBF"),
+    bottom=Side(style="thin", color="BFBFBF"),
+)
+
+def get_nse_symbols():
+    """Download full NSE equity symbol list from NSE website."""
+    log.info("Fetching NSE symbol list...")
+    url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+    try:
+        df = pd.read_csv(url)
+        symbols = [f"{s.strip()}.NS" for s in df["SYMBOL"].dropna().tolist()]
+        log.info(f"Found {len(symbols)} NSE symbols")
+        return symbols
+    except Exception as e:
+        log.warning(f"NSE direct fetch failed ({e}), using fallback Nifty 500 list")
+        # Fallback: well-known NSE tickers
+        return [
+            "RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS","HINDUNILVR.NS",
+            "ICICIBANK.NS","SBIN.NS","BHARTIARTL.NS","KOTAKBANK.NS","ITC.NS",
+            "LT.NS","AXISBANK.NS","ASIANPAINT.NS","MARUTI.NS","HCLTECH.NS",
+            "SUNPHARMA.NS","WIPRO.NS","ULTRACEMCO.NS","TITAN.NS","NESTLEIND.NS",
+            "BAJFINANCE.NS","BAJAJFINSV.NS","POWERGRID.NS","NTPC.NS","ONGC.NS",
+            "TECHM.NS","M&M.NS","INDUSINDBK.NS","DRREDDY.NS","DIVISLAB.NS",
+        ]
+
+def fetch_batch(symbols):
+    """Fetch summary info for a batch of symbols using yfinance download."""
+    tickers = yf.Tickers(" ".join(symbols))
+    rows = []
+    for sym in symbols:
+        try:
+            t = tickers.tickers.get(sym)
+            if t is None:
+                continue
+            info = t.info or {}
+            if not info.get("symbol"):
+                continue
+            rows.append({
+                "Symbol":                  sym,
+                "Company Name":            info.get("longName", ""),
+                "Sector":                  info.get("sector", ""),
+                "Industry":                info.get("industry", ""),
+                "Exchange":                info.get("exchange", ""),
+                "Currency":                info.get("currency", ""),
+                "Country":                 info.get("country", ""),
+                "Website":                 info.get("website", ""),
+                # Price
+                "Current Price":           info.get("currentPrice") or info.get("regularMarketPrice"),
+                "Previous Close":          info.get("previousClose"),
+                "Open":                    info.get("open"),
+                "Day Low":                 info.get("dayLow"),
+                "Day High":                info.get("dayHigh"),
+                "52 Week Low":             info.get("fiftyTwoWeekLow"),
+                "52 Week High":            info.get("fiftyTwoWeekHigh"),
+                "50 Day Avg":              info.get("fiftyDayAverage"),
+                "200 Day Avg":             info.get("twoHundredDayAverage"),
+                # Volume
+                "Volume":                  info.get("volume"),
+                "Avg Volume (10d)":        info.get("averageVolume10days"),
+                "Avg Volume":              info.get("averageVolume"),
+                # Market Cap & Value
+                "Market Cap":              info.get("marketCap"),
+                "Enterprise Value":        info.get("enterpriseValue"),
+                "Shares Outstanding":      info.get("sharesOutstanding"),
+                "Float Shares":            info.get("floatShares"),
+                "Shares Short":            info.get("sharesShort"),
+                # Valuation Ratios
+                "PE Ratio (TTM)":          info.get("trailingPE"),
+                "Forward PE":              info.get("forwardPE"),
+                "PEG Ratio":               info.get("pegRatio"),
+                "Price/Sales (TTM)":       info.get("priceToSalesTrailing12Months"),
+                "Price/Book":              info.get("priceToBook"),
+                "EV/Revenue":              info.get("enterpriseToRevenue"),
+                "EV/EBITDA":               info.get("enterpriseToEbitda"),
+                # Financials
+                "Revenue (TTM)":           info.get("totalRevenue"),
+                "Revenue Per Share":       info.get("revenuePerShare"),
+                "Gross Profit":            info.get("grossProfits"),
+                "EBITDA":                  info.get("ebitda"),
+                "Net Income (TTM)":        info.get("netIncomeToCommon"),
+                "EPS (TTM)":               info.get("trailingEps"),
+                "Forward EPS":             info.get("forwardEps"),
+                "Total Cash":              info.get("totalCash"),
+                "Total Cash Per Share":    info.get("totalCashPerShare"),
+                "Total Debt":              info.get("totalDebt"),
+                "Debt/Equity":             info.get("debtToEquity"),
+                "Current Ratio":           info.get("currentRatio"),
+                "Quick Ratio":             info.get("quickRatio"),
+                "Book Value Per Share":    info.get("bookValue"),
+                # Margins & Returns
+                "Gross Margin":            info.get("grossMargins"),
+                "Operating Margin":        info.get("operatingMargins"),
+                "Profit Margin":           info.get("profitMargins"),
+                "EBITDA Margin":           info.get("ebitdaMargins"),
+                "Return on Assets":        info.get("returnOnAssets"),
+                "Return on Equity":        info.get("returnOnEquity"),
+                # Growth
+                "Revenue Growth (YoY)":    info.get("revenueGrowth"),
+                "Earnings Growth (YoY)":   info.get("earningsGrowth"),
+                "Earnings Quarterly Growth": info.get("earningsQuarterlyGrowth"),
+                # Dividends
+                "Dividend Rate":           info.get("dividendRate"),
+                "Dividend Yield":          info.get("dividendYield"),
+                "Ex-Dividend Date":        info.get("exDividendDate"),
+                "Payout Ratio":            info.get("payoutRatio"),
+                "5Y Avg Dividend Yield":   info.get("fiveYearAvgDividendYield"),
+                # Analyst
+                "Analyst Target Price":    info.get("targetMeanPrice"),
+                "Analyst Low Target":      info.get("targetLowPrice"),
+                "Analyst High Target":     info.get("targetHighPrice"),
+                "Recommendation":          info.get("recommendationKey"),
+                "No. of Analyst Opinions": info.get("numberOfAnalystOpinions"),
+                # Governance
+                "Audit Risk":              info.get("auditRisk"),
+                "Board Risk":              info.get("boardRisk"),
+                "Compensation Risk":       info.get("compensationRisk"),
+                "Shareholder Rights Risk": info.get("shareHolderRightsRisk"),
+                "Overall Risk":            info.get("overallRisk"),
+                # Beta
+                "Beta":                    info.get("beta"),
+                # Dates
+                "Fiscal Year End":         info.get("fiscalYearEnd"),
+                "Most Recent Quarter":     info.get("mostRecentQuarter"),
+            })
+        except Exception as ex:
+            log.debug(f"Skipping {sym}: {ex}")
+    return rows
+
+
+def style_sheet(ws, df, title):
+    """Apply professional formatting to a worksheet."""
+    ws.insert_rows(1)
+    ws.insert_rows(1)
+    ws["A1"] = title
+    ws["A1"].font = TITLE_FONT
+    ws["A2"] = f"Generated: {datetime.datetime.now().strftime('%d %b %Y  %H:%M')}  |  Rows: {len(df)}"
+    ws["A2"].font = Font(name="Arial", size=9, italic=True, color="595959")
+
+    header_row = 3
+    for col_idx, col_name in enumerate(df.columns, 1):
+        cell = ws.cell(row=header_row, column=col_idx, value=col_name)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = THIN_BORDER
+
+    ws.row_dimensions[header_row].height = 32
+
+    for r_idx, row in enumerate(df.itertuples(index=False), header_row + 1):
+        fill = ALT_ROW_FILL if r_idx % 2 == 0 else None
+        for c_idx, val in enumerate(row, 1):
+            cell = ws.cell(row=r_idx, column=c_idx, value=val)
+            cell.font = NORMAL_FONT
+            cell.border = THIN_BORDER
+            if fill:
+                cell.fill = fill
+
+    for col_idx, col_name in enumerate(df.columns, 1):
+        col_letter = get_column_letter(col_idx)
+        max_len = max(
+            len(str(col_name)),
+            *[len(str(ws.cell(row=r, column=col_idx).value or "")) for r in range(header_row, min(header_row + 50, ws.max_row + 1))]
+        )
+        ws.column_dimensions[col_letter].width = min(max_len + 3, 35)
+
+    ws.freeze_panes = f"A{header_row + 1}"
+    ws.auto_filter.ref = ws.dimensions
+
+
+def build_excel(all_rows, output_path):
+    log.info("Building Excel workbook...")
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    df_main = pd.DataFrame(all_rows)
+    if df_main.empty:
+        log.warning("No data fetched!")
+        return False
+
+    # ── Sheet 1: Overview ──────────────────────────────────────────────
+    overview_cols = [
+        "Symbol","Company Name","Sector","Industry","Current Price","Market Cap",
+        "PE Ratio (TTM)","EPS (TTM)","52 Week Low","52 Week High","Beta",
+        "Dividend Yield","Return on Equity","Profit Margin","Recommendation"
+    ]
+    ws_ov = wb.create_sheet("Overview")
+    df_ov = df_main[[c for c in overview_cols if c in df_main.columns]].copy()
+    for col in ["Market Cap","Current Price","52 Week Low","52 Week High"]:
+        if col in df_ov.columns:
+            df_ov[col] = pd.to_numeric(df_ov[col], errors="coerce").round(2)
+    style_sheet(ws_ov, df_ov, "NSE Listed Stocks — Overview")
+
+    # ── Sheet 2: Valuation ─────────────────────────────────────────────
+    val_cols = [
+        "Symbol","Company Name","Sector","Current Price","Market Cap","Enterprise Value",
+        "PE Ratio (TTM)","Forward PE","PEG Ratio","Price/Sales (TTM)","Price/Book",
+        "EV/Revenue","EV/EBITDA","Beta"
+    ]
+    ws_val = wb.create_sheet("Valuation")
+    df_val = df_main[[c for c in val_cols if c in df_main.columns]].copy()
+    style_sheet(ws_val, df_val, "NSE Listed Stocks — Valuation Metrics")
+
+    # ── Sheet 3: Financials ────────────────────────────────────────────
+    fin_cols = [
+        "Symbol","Company Name","Sector","Revenue (TTM)","Gross Profit","EBITDA",
+        "Net Income (TTM)","EPS (TTM)","Forward EPS","Total Cash","Total Debt",
+        "Debt/Equity","Current Ratio","Quick Ratio","Book Value Per Share"
+    ]
+    ws_fin = wb.create_sheet("Financials")
+    df_fin = df_main[[c for c in fin_cols if c in df_main.columns]].copy()
+    style_sheet(ws_fin, df_fin, "NSE Listed Stocks — Financials")
+
+    # ── Sheet 4: Margins & Returns ─────────────────────────────────────
+    mg_cols = [
+        "Symbol","Company Name","Sector","Gross Margin","Operating Margin",
+        "Profit Margin","EBITDA Margin","Return on Assets","Return on Equity",
+        "Revenue Growth (YoY)","Earnings Growth (YoY)","Earnings Quarterly Growth"
+    ]
+    ws_mg = wb.create_sheet("Margins & Returns")
+    df_mg = df_main[[c for c in mg_cols if c in df_main.columns]].copy()
+    pct_cols = ["Gross Margin","Operating Margin","Profit Margin","EBITDA Margin",
+                "Return on Assets","Return on Equity","Revenue Growth (YoY)",
+                "Earnings Growth (YoY)","Earnings Quarterly Growth"]
+    for c in pct_cols:
+        if c in df_mg.columns:
+            df_mg[c] = pd.to_numeric(df_mg[c], errors="coerce").mul(100).round(2).astype(str) + "%"
+    style_sheet(ws_mg, df_mg, "NSE Listed Stocks — Margins & Returns")
+
+    # ── Sheet 5: Dividends ─────────────────────────────────────────────
+    div_cols = [
+        "Symbol","Company Name","Sector","Dividend Rate","Dividend Yield",
+        "Ex-Dividend Date","Payout Ratio","5Y Avg Dividend Yield"
+    ]
+    ws_div = wb.create_sheet("Dividends")
+    df_div = df_main[[c for c in div_cols if c in df_main.columns]].copy()
+    style_sheet(ws_div, df_div, "NSE Listed Stocks — Dividends")
+
+    # ── Sheet 6: Analyst Targets ───────────────────────────────────────
+    an_cols = [
+        "Symbol","Company Name","Sector","Current Price","Analyst Target Price",
+        "Analyst Low Target","Analyst High Target","Recommendation",
+        "No. of Analyst Opinions"
+    ]
+    ws_an = wb.create_sheet("Analyst Targets")
+    df_an = df_main[[c for c in an_cols if c in df_main.columns]].copy()
+    style_sheet(ws_an, df_an, "NSE Listed Stocks — Analyst Targets")
+
+    # ── Sheet 7: Full Data ─────────────────────────────────────────────
+    ws_full = wb.create_sheet("Full Data")
+    style_sheet(ws_full, df_main, "NSE Listed Stocks — All Available Fields")
+
+    wb.save(output_path)
+    log.info(f"Excel saved → {output_path}  ({len(all_rows)} stocks, {len(wb.sheetnames)} sheets)")
+    return True
+
+
+def send_email(filepath, cfg):
+    log.info(f"Sending email to {cfg['recipient_email']}...")
+    msg = MIMEMultipart()
+    msg["From"]    = cfg["sender_email"]
+    msg["To"]      = cfg["recipient_email"]
+    msg["Subject"] = f"NSE Stock Report — {datetime.date.today().strftime('%d %b %Y')}"
+
+    body = f"""Hello,
+
+Please find attached the NSE Stock Market Report generated on {datetime.datetime.now().strftime('%d %b %Y at %H:%M')}.
+
+The Excel file contains 7 sheets:
+  1. Overview          – Key metrics at a glance
+  2. Valuation         – PE, EV/EBITDA, Price/Book etc.
+  3. Financials        – Revenue, Profit, Debt, Cash
+  4. Margins & Returns – Gross/Net margin, ROE, ROA
+  5. Dividends         – Yield, payout ratio, ex-dividend dates
+  6. Analyst Targets   – Target prices & recommendations
+  7. Full Data         – All available yfinance fields
+
+Data sourced from Yahoo Finance via yfinance.
+
+Regards,
+NSE Stock Report Bot
+"""
+    msg.attach(MIMEText(body, "plain"))
+
+    with open(filepath, "rb") as f:
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(f.read())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(filepath)}")
+    msg.attach(part)
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(cfg["sender_email"], cfg["sender_password"])
+        server.sendmail(cfg["sender_email"], cfg["recipient_email"], msg.as_string())
+    log.info("Email sent successfully!")
+
+
+def main():
+    symbols = get_nse_symbols()
+    if CONFIG["max_stocks"]:
+        symbols = symbols[:CONFIG["max_stocks"]]
+    log.info(f"Processing {len(symbols)} symbols...")
+
+    all_rows = []
+    batch_size = CONFIG["batch_size"]
+    total_batches = (len(symbols) + batch_size - 1) // batch_size
+
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        log.info(f"Batch {batch_num}/{total_batches}: {batch[0]} … {batch[-1]}")
+        rows = fetch_batch(batch)
+        all_rows.extend(rows)
+        log.info(f"  → {len(rows)} records fetched (total so far: {len(all_rows)})")
+        if batch_num < total_batches:
+            time.sleep(CONFIG["delay_between_batches"])
+
+    output_path = CONFIG["output_file"]
+    success = build_excel(all_rows, output_path)
+
+    if success:
+        send_email(output_path, CONFIG)
+        print(f"\n✅ Done! Report with {len(all_rows)} stocks sent to {CONFIG['recipient_email']}")
+    else:
+        print("\n❌ No data was fetched. Check your internet connection or try again.")
+
+
+if __name__ == "__main__":
+    main()
