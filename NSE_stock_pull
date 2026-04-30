@@ -33,9 +33,9 @@ log = logging.getLogger(__name__)
 #  CONFIG — Fill these in before running
 # ─────────────────────────────────────────────
 CONFIG = {
-    "sender_email":    "your_gmail@gmail.com",       # Gmail address used to send
-    "sender_password": "xxxx xxxx xxxx xxxx",        # Gmail App Password (16 chars)
-    "recipient_email": "recipient@example.com",      # Where to send the report
+    "sender_email":    "raitdocs@gmail.com",       # Gmail address used to send
+    "sender_password": "vldzu-WJPEJrQ4k8Rd",        # Gmail App Password (16 chars)
+    "recipient_email": "raitdocs@example.com",      # Where to send the report
     "output_file":     "NSE_Stock_Report.xlsx",
     "batch_size":      50,    # stocks fetched per batch (reduce if rate-limited)
     "delay_between_batches": 2,  # seconds between batches
